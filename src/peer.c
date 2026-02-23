@@ -7,6 +7,30 @@
 peer_t *peers = NULL;
 static int userid = 0;
 
+static int GetGlobalProbeSocketsOpen(void) {
+	int count = 0;
+	peer_t *p;
+	for (p = peers; p; p = p->next) {
+		if (p->ps == ps_pingprobe) {
+			int i;
+			for (i = 0; i < p->num_probes; i++) {
+				if (p->probes[i].s != INVALID_SOCKET)
+					count++;
+			}
+		}
+	}
+	return count;
+}
+
+#define MAX_TOTAL_PROBE_SOCKETS 64
+
+static const char probe_payload_qw[] = {0xff, 0xff, 0xff, 0xff, 'p', 'i', 'n', 'g', '\n'};
+static const char probe_payload_gen[] = {A2A_PING, 0};
+
+cvar_t *sv_pathprobe_enable;
+cvar_t *sv_pathprobe_count;
+cvar_t *sv_pathprobe_delay;
+
 peer_t	*FWD_peer_by_addr(struct sockaddr_in *from)
 {
 	peer_t *p;
@@ -69,7 +93,7 @@ peer_t	*FWD_peer_new(const char *remote_host, int remote_port, struct sockaddr_i
 	p->s		= ( new_peer ) ? s : p->s; // reuse socket in case of reusing
 	p->from		= *from;
 	p->to		= to;
-	p->ps		= ( !new_peer && proto == pr_q3 ) ? p->ps : ps_challenge; // do not reset state for q3 in case of peer reusing
+	p->ps		= ( !new_peer && (proto == pr_q3 || p->ps == ps_pingprobe) ) ? p->ps : ps_challenge; // do not reset state for q3 or ongoing probes in case of peer reusing
 	p->qport	= qport;
 	p->proto	= proto;
 	strlcpy(p->userinfo, userinfo, sizeof(p->userinfo));
@@ -93,6 +117,8 @@ peer_t	*FWD_peer_new(const char *remote_host, int remote_port, struct sockaddr_i
 // free peer data, perform unlink if requested
 static void FWD_peer_free(peer_t *peer, qbool unlink)
 {
+	int i;
+
 	if (!peer)
 		return;
 
@@ -122,9 +148,20 @@ static void FWD_peer_free(peer_t *peer, qbool unlink)
 		}
 	}
 
+	// free probes if any
+	for (i = 0; i < peer->num_probes; i++) {
+		if (peer->probes[i].s != INVALID_SOCKET && peer->probes[i].s != peer->s) {
+			closesocket(peer->probes[i].s);
+			peer->probes[i].s = INVALID_SOCKET;
+		}
+	}
+
 	// free all data related to peer
-	if (peer->s) // there should be no zero socket, it's stdin
+	if (peer->s) { // there should be no zero socket, it's stdin
 		closesocket(peer->s);
+		peer->s = INVALID_SOCKET;
+	}
+
 	Sys_free(peer);
 }
 
@@ -181,187 +218,421 @@ static void FWD_check_drop(void)
 	}
 }
 
-static void FWD_network_update(void)
-{
-	fd_set rfds;
-	struct timeval tv;
-	int retval;
-	int i1;
-	peer_t *p;
+// Start probing for the best source port
+void FWD_PeerStartProbing(peer_t *p) {
+  int count = sv_pathprobe_count->integer;
+  int i;
+  const void *payload;
+  int payload_len;
 
-	FD_ZERO(&rfds);
+  if (count < 1)
+    count = 1;
+  if (count > MAX_PING_PROBES)
+    count = MAX_PING_PROBES;
 
-	// select on main server socket
-	FD_SET(net_socket, &rfds);
-	i1 = net_socket + 1;
+  // Close any existing probe sockets to prevent leaks on reuse
+  for (i = 0; i < p->num_probes; i++) {
+    if (p->probes[i].s != INVALID_SOCKET && p->probes[i].s > 0 &&
+        p->probes[i].s != p->s) {
+      closesocket(p->probes[i].s);
+    }
+  }
 
-	for (p = peers; p; p = p->next)
-	{
-		// select on peers sockets
-		FD_SET(p->s, &rfds);
-		if (p->s >= i1)
-			i1 = p->s + 1;
-	}
+  p->ps = ps_pingprobe;
+  p->num_probes = 0;
+  memset(p->probes, 0, sizeof(p->probes));
+  for (i = 0; i < MAX_PING_PROBES; i++) {
+    p->probes[i].s = INVALID_SOCKET;
+  }
+  p->probe_start_time = Sys_DoubleTime();
+
+  if (p->proto == pr_qw) {
+    payload = probe_payload_qw;
+    payload_len = sizeof(probe_payload_qw);
+  } else {
+    payload = probe_payload_gen;
+    payload_len = sizeof(probe_payload_gen);
+  }
+
+  // Use existing socket as first probe
+  if (p->s != INVALID_SOCKET) {
+    p->probes[0].s = p->s;
+    p->probes[0].send_time = Sys_DoubleTime();
+    p->probes[0].rtt = -1;
+    p->probes[0].samples_sent = 1;
+    p->num_probes++;
+    NET_SendPacket(p->s, payload_len, payload, &p->to);
+  }
+
+  // Create additional sockets
+  for (i = p->num_probes; i < count; i++) {
+    if (GetGlobalProbeSocketsOpen() >= MAX_TOTAL_PROBE_SOCKETS) {
+      Sys_DPrintf(
+          "Global probe socket limit reached (%d), skipping probe socket\n",
+          MAX_TOTAL_PROBE_SOCKETS);
+      break;
+    }
+
+    int s = NET_UDP_OpenSocket(NULL, 0, false);
+    if (s != INVALID_SOCKET) {
+      p->probes[p->num_probes].s = s;
+      p->probes[p->num_probes].send_time = Sys_DoubleTime();
+      p->probes[p->num_probes].rtt = -1;
+      p->probes[p->num_probes].samples_sent = 1;
+      p->num_probes++;
+      NET_SendPacket(s, payload_len, payload, &p->to);
+    }
+  }
+
+  Sys_DPrintf("Started probing %d ports for peer %s\n", p->num_probes, p->name);
+}
+
+// Check if probing is done or timed out
+static void FWD_CheckProbeCompletion(peer_t *p) {
+  int i;
+  int best_idx = -1;
+  double best_rtt = 99999.0;
+  double timeout = sv_pathprobe_delay->value / 1000.0;
+  qbool all_finished = true;
+  int fully_sampled = 0;
+
+  if (timeout <= 0.0)
+    timeout = 1.0;
+  if (timeout > 10.0)
+    timeout = 10.0;
+
+  // Check if all probes are finished
+  for (i = 0; i < p->num_probes; i++) {
+    if (p->probes[i].samples_received >= 2)
+      fully_sampled++;
+
+    if (p->probes[i].samples_received < PROBE_SAMPLES_COUNT) {
+      all_finished = false;
+    }
+  }
+
+  // Wait for at least 2 samples from everyone to filter jitter, unless timed
+  // out
+  if (fully_sampled == p->num_probes)
+    goto select_best;
+
+  // Only proceed if we timed out or all probes finished
+  if (!all_finished && Sys_DoubleTime() - p->probe_start_time <= timeout)
+    return;
+
+select_best:
+  // Find best RTT
+  for (i = 0; i < p->num_probes; i++) {
+    if (p->probes[i].rtt > 0 && p->probes[i].rtt < best_rtt) {
+      best_rtt = p->probes[i].rtt;
+      best_idx = i;
+    }
+  }
+
+  if (best_idx != -1) {
+    Sys_DPrintf("Probe finished in %.2f ms. Best RTT: %.2f ms (idx %d)\n",
+                (Sys_DoubleTime() - p->probe_start_time) * 1000.0,
+                best_rtt * 1000.0, best_idx);
+    p->s = p->probes[best_idx].s;
+
+    // Notify client about the best ping found
+    if (p->proto == pr_qw) {
+      Netchan_OutOfBandPrint(net_socket, &p->from,
+                             "%c[qwfwd] Best RTT: %.2f ms\n", A2C_PRINT,
+                             best_rtt * 1000.0);
+    } else {
+      Netchan_OutOfBandPrint(net_socket, &p->from,
+                             "print\n[qwfwd] Best RTT: %.2f ms\n",
+                             best_rtt * 1000.0);
+    }
+
+  } else {
+    Sys_DPrintf("Probe finished. No reply, using default.\n");
+    p->s = p->probes[0].s; // Fallback to first
+  }
+
+  // Close other sockets
+  for (i = 0; i < p->num_probes; i++) {
+    if (p->probes[i].s != p->s && p->probes[i].s != INVALID_SOCKET) {
+      closesocket(p->probes[i].s);
+      p->probes[i].s = INVALID_SOCKET;
+    }
+  }
+
+  // Send connection packet to client now that we are ready
+  if (p->proto == pr_qw) {
+    Netchan_OutOfBandPrint(net_socket, &p->from, "%c", S2C_CONNECTION);
+  } else {
+    Netchan_OutOfBandPrint(net_socket, &p->from, "connectResponse");
+  }
+
+  p->ps = ps_connecting;
+  p->connect = 0;
+}
+
+// Process incoming packets on probe sockets
+static void FWD_ProcessProbes(peer_t *p, net_pollfd_t *pfds) {
+  int i;
+  int current_probe_pfd = 0;
+  const void *payload;
+  int payload_len;
+
+  if (p->proto == pr_qw) {
+    payload = QW_PROBE_PAYLOAD;
+    payload_len = sizeof(QW_PROBE_PAYLOAD) - 1;
+  } else {
+    payload = GEN_PROBE_PAYLOAD;
+    payload_len = sizeof(GEN_PROBE_PAYLOAD) - 1;
+  }
+
+  for (i = 0; i < p->num_probes; i++) {
+    if (p->probes[i].s != INVALID_SOCKET) {
+      if (pfds[current_probe_pfd].revents & POLLIN) {
+        if (NET_GetPacket(p->probes[i].s, &net_message)) {
+          if (NET_CompareAddress(&p->to, &net_from)) {
+            // Any reply from the server on the probe socket is enough to
+            // measure RTT
+            double rtt = Sys_DoubleTime() - p->probes[i].send_time;
+
+            p->probes[i].samples_received++;
+
+            if (p->probes[i].rtt == -1 || rtt < p->probes[i].rtt) {
+              p->probes[i].rtt = rtt;
+              Sys_DPrintf(
+                  "Pathprobe reply on socket %d, sample %d, RTT %.2f ms\n",
+                  p->probes[i].s, p->probes[i].samples_received,
+                  p->probes[i].rtt * 1000.0);
+            }
+
+            // Send next sample if needed
+            if (p->probes[i].samples_sent < PROBE_SAMPLES_COUNT) {
+              p->probes[i].samples_sent++;
+              p->probes[i].send_time = Sys_DoubleTime();
+              NET_SendPacket(p->probes[i].s, payload_len, payload, &p->to);
+            }
+          }
+        }
+      }
+      current_probe_pfd++;
+    }
+  }
+}
+
+static void FWD_network_update(void) {
+  net_pollfd_t *pfds = NULL;
+  int nfds = 0;
+  int max_fds = 2; // net + stdin
+  int retval;
+  int net_idx = -1;
+  int stdin_idx = -1;
+  peer_t *p;
+  int i;
+  int current_pfd_idx;
+
+  // Calculate max FDs needed
+  for (p = peers; p; p = p->next) {
+    if (p->ps == ps_pingprobe) {
+      max_fds += p->num_probes;
+    } else {
+      max_fds++;
+    }
+  }
+
+  pfds = Sys_malloc(sizeof(net_pollfd_t) * max_fds);
+
+  // select on main server socket
+  pfds[nfds].fd = net_socket;
+  pfds[nfds].events = POLLIN;
+  pfds[nfds].revents = 0;
+  net_idx = nfds++;
+
+  for (p = peers; p; p = p->next) {
+    // select on peers sockets
+    if (p->ps == ps_pingprobe) {
+      for (i = 0; i < p->num_probes; i++) {
+        if (p->probes[i].s != INVALID_SOCKET) {
+          pfds[nfds].fd = p->probes[i].s;
+          pfds[nfds].events = POLLIN;
+          pfds[nfds].revents = 0;
+          nfds++;
+        }
+      }
+    } else {
+      pfds[nfds].fd = p->s;
+      pfds[nfds].events = POLLIN;
+      pfds[nfds].revents = 0;
+      nfds++;
+    }
+  }
 
 // if not DLL - read stdin
 #ifndef APP_DLL
-	#ifndef _WIN32
-	// try read stdin only if connected to a terminal.
-	if (isatty(STDIN) && isatty(STDOUT))
-	{
-		FD_SET(STDIN, &rfds);
-		if (STDIN >= i1)
-			i1 = STDIN + 1;
-	}
-	#endif // _WIN32
+#ifndef _WIN32
+  // try read stdin only if connected to a terminal.
+  if (isatty(STDIN) && isatty(STDOUT)) {
+    pfds[nfds].fd = STDIN;
+    pfds[nfds].events = POLLIN;
+    pfds[nfds].revents = 0;
+    stdin_idx = nfds++;
+  }
+#endif // _WIN32
 #endif
 
-	/* Sleep for some time, wake up immidiately if there input packet. */
-	tv.tv_sec = 0;
-	tv.tv_usec = 100000; // 100 ms
-
 retry:
-	retval = select(i1, &rfds, (fd_set *)0, (fd_set *)0, &tv);
-	if (retval < 0)
-	{
-		if (errno == EINTR)
-		{
-			goto retry;
-		}
-		perror("select");
-		return;
-	}
+  retval = qpoll(pfds, nfds, 100);
+  if (retval < 0) {
+    if (errno == EINTR) {
+      goto retry;
+    }
+    perror("poll");
+    Sys_free(pfds);
+    return;
+  }
 
-	// read console input.
-	// NOTE: we do not do that if we are in DLL mode...
-	Sys_ReadSTDIN(&ps, rfds);
+  // read console input.
+  // NOTE: we do not do that if we are in DLL mode...
+  if (stdin_idx != -1 && (pfds[stdin_idx].revents & POLLIN)) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(STDIN, &rfds);
+    Sys_ReadSTDIN(&ps, rfds);
+  }
 
-	if (retval <= 0)
-		return;
+  // if we have input packet on main server/proxy socket, then read it
+  if (net_idx != -1 && (pfds[net_idx].revents & POLLIN)) {
+    qbool connectionless;
+    int cnt;
 
-	// if we have input packet on main server/proxy socket, then read it
-	if(FD_ISSET(net_socket, &rfds))
-	{
-		qbool connectionless;
-		int cnt;
+    // read it
+    for (;;) {
+      if (!NET_GetPacket(net_socket, &net_message))
+        break;
 
-		// read it
-		for(;;)
-		{
-			if (!NET_GetPacket(net_socket, &net_message))
-				break;
+      // check for bans.
+      if (SV_IsBanned(&net_from))
+        continue;
 
-			// check for bans.
-			if (SV_IsBanned(&net_from))
-				continue;
+      if (net_message.cursize == 1 && net_message.data[0] == A2A_ACK) {
+        QRY_SV_PingReply();
 
-			if (net_message.cursize == 1 && net_message.data[0] == A2A_ACK)
-			{
-				QRY_SV_PingReply();
+        continue;
+      }
 
-				continue;
-			}
+      MSG_BeginReading();
+      connectionless = (MSG_ReadLong() == -1);
 
-			MSG_BeginReading();
-			connectionless = (MSG_ReadLong() == -1);
+      if (connectionless) {
+        if (MSG_BadRead())
+          continue;
 
-			if (connectionless)
-			{
-				if (MSG_BadRead())
-					continue;
+        if (!SV_ConnectionlessPacket())
+          continue; // seems we do not need forward it
+      }
 
-				if (!SV_ConnectionlessPacket())
-					continue; // seems we do not need forward it
-			}
+      // search in peers
+      for (p = peers; p; p = p->next) {
+        // we have this peer already, so forward/send packet to remote server
+        if (NET_CompareAddress(&p->from, &net_from))
+          break;
+      }
 
-			// search in peers
-			for (p = peers; p; p = p->next)
-			{
-				// we have this peer already, so forward/send packet to remote server
-				if (NET_CompareAddress(&p->from, &net_from))
-					break;
-			}
+      // peer was not found
+      if (!p)
+        continue;
 
-			// peer was not found
-			if (!p)
-				continue;
+      // forward data to the server/proxy
+      if (p->ps >= ps_connected) {
+        cnt = 1; // one packet by default
 
-			// forward data to the server/proxy
-			if (p->ps >= ps_connected)
-			{
-				cnt = 1; // one packet by default
+        // check for "drop" aka client disconnect,
+        // first 10 bytes for NON connectionless packet is netchan related shit
+        // in QW
+        if (p->proto == pr_qw && !connectionless && net_message.cursize > 10 &&
+            net_message.data[10] == clc_stringcmd) {
+          if (!strcmp((char *)net_message.data + 10 + 1, "drop")) {
+            //						Sys_Printf("peer drop
+            // detected\n");
+            p->ps = ps_drop; // drop peer ASAP
+            cnt = 3;         // send few packets due to possibile packet lost
+          }
+        }
 
-				// check for "drop" aka client disconnect,
-				// first 10 bytes for NON connectionless packet is netchan related shit in QW
-				if (p->proto == pr_qw && !connectionless && net_message.cursize > 10 && net_message.data[10] == clc_stringcmd)
-				{
-					if (!strcmp((char*)net_message.data + 10 + 1, "drop"))
-					{
-//						Sys_Printf("peer drop detected\n");
-						p->ps = ps_drop; // drop peer ASAP
-						cnt = 3; // send few packets due to possibile packet lost
-					}
-				}
+        for (; cnt > 0; cnt--)
+          NET_SendPacket(p->s, net_message.cursize, net_message.data, &p->to);
+      }
 
-				for ( ; cnt > 0; cnt--)
-					NET_SendPacket(p->s, net_message.cursize, net_message.data, &p->to);
-			}
+      time(&p->last);
+    }
+  }
 
-			time(&p->last);
-		}
-	}
+  // now lets check peers sockets, perhaps we have input packets too
+  current_pfd_idx = 1; // skip net_socket
+  for (p = peers; p; p = p->next) {
+    if (p->ps == ps_pingprobe) {
+      FWD_ProcessProbes(p, &pfds[current_pfd_idx]);
 
-	// now lets check peers sockets, perhaps we have input packets too
-	for (p = peers; p; p = p->next)
-	{
-		if(FD_ISSET(p->s, &rfds))
-		{
-			// yeah, we have packet, read it then
-			for (;;)
-			{
-				if (!NET_GetPacket(p->s, &net_message))
-					break;
+      // count how many we used
+      for (i = 0; i < p->num_probes; i++) {
+        if (p->probes[i].s != INVALID_SOCKET)
+          current_pfd_idx++;
+      }
 
-				// check for bans.
-				if (SV_IsBanned(&net_from))
-					continue;
+      // Check completion again in case we got last packet or timed out
+      FWD_CheckProbeCompletion(p);
+      continue; // Skip normal processing for this peer
+    }
 
-				// we should check is this packet from remote server, this may be some evil packet from haxors...
-				if (!NET_CompareAddress(&p->to, &net_from))
-					continue;
+    if (pfds[current_pfd_idx].revents & POLLIN) {
+      // yeah, we have packet, read it then
+      for (;;) {
+        if (!NET_GetPacket(p->s, &net_message))
+          break;
 
-				MSG_BeginReading();
-				if (MSG_ReadLong() == -1)
-				{
-					if (MSG_BadRead())
-						continue;
+        // check for bans.
+        if (SV_IsBanned(&net_from))
+          continue;
 
-					if (!CL_ConnectionlessPacket(p))
-						continue; // seems we do not need forward it
+        // we should check is this packet from remote server, this may be some
+        // evil packet from haxors...
+        if (!NET_CompareAddress(&p->to, &net_from))
+          continue;
 
-					NET_SendPacket(net_socket, net_message.cursize, net_message.data, &p->from);
-					continue;
-				}
+        MSG_BeginReading();
+        if (MSG_ReadLong() == -1) {
+          if (MSG_BadRead())
+            continue;
 
-				if (p->ps >= ps_connected)
-					NET_SendPacket(net_socket, net_message.cursize, net_message.data, &p->from);
+          if (!CL_ConnectionlessPacket(p))
+            continue; // seems we do not need forward it
 
-// qqshka: commented out
-//				time(&p->last);
+          NET_SendPacket(net_socket, net_message.cursize, net_message.data,
+                         &p->from);
+          continue;
+        }
 
-			} // for (;;)
-		} // if(FD_ISSET(p->s, &rfds))
+        if (p->ps >= ps_connected)
+          NET_SendPacket(net_socket, net_message.cursize, net_message.data,
+                         &p->from);
 
-		if (p->ps == ps_challenge)
-		{
-			// send challenge time to time
-			if (time(NULL) - p->connect > 2)
-			{
-				p->connect = time(NULL);
-				Netchan_OutOfBandPrint(p->s, &p->to, "getchallenge%s", p->proto == pr_qw ? "\n" : "");
-			}
-		}
-	} // for (p = peers; p; p = p->next)
+        // qqshka: commented out
+        //				time(&p->last);
+
+      } // for (;;)
+    } // if(POLLIN)
+
+    current_pfd_idx++;
+
+    if (p->ps == ps_challenge || p->ps == ps_connecting) {
+      // send challenge time to time
+      if (time(NULL) - p->connect > 2) {
+        p->connect = time(NULL);
+        Netchan_OutOfBandPrint(p->s, &p->to, "getchallenge%s",
+                               p->proto == pr_qw ? "\n" : "");
+      }
+    }
+  } // for (p = peers; p; p = p->next)
+
+  Sys_free(pfds);
 }
 
 int FWD_peers_count(void)
