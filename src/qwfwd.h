@@ -163,6 +163,7 @@ typedef struct {
   double rtt;
   int samples_sent;
   int samples_received;
+  short revents;				// poll() result for this probe socket, see FWD_network_update()
 } probe_t;
 
 
@@ -183,6 +184,7 @@ typedef struct peer
 	int s;							// socket, used for connection to remote host
 	peer_state_t ps;				// peer state
 	protocol_t	proto;				// which protocol we use
+	short revents;					// poll() result for 's', see FWD_network_update()
 	struct peer *next;				// next peer in linked list
 
 	// pingprobe

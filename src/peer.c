@@ -24,6 +24,14 @@ static int GetGlobalProbeSocketsOpen(void) {
 
 #define MAX_TOTAL_PROBE_SOCKETS 64
 
+// Records which peer (and which of its probe sockets, if any) owns each entry
+// of the pollfd array, so readiness can be handed back to the owner by pointer
+// instead of by array position. See FWD_network_update().
+typedef struct {
+	peer_t  *peer;
+	probe_t *probe; // NULL when the entry is the peer's main socket
+} pfd_owner_t;
+
 static const char probe_payload_qw[] = {0xff, 0xff, 0xff, 0xff, 'p', 'i', 'n', 'g', '\n'};
 static const char probe_payload_gen[] = {A2A_PING, 0};
 
@@ -370,10 +378,12 @@ select_best:
   p->connect = 0;
 }
 
-// Process incoming packets on probe sockets
-static void FWD_ProcessProbes(peer_t *p, net_pollfd_t *pfds) {
+// Process incoming packets on probe sockets.
+// Readiness comes from probes[i].revents, which FWD_network_update() copied out
+// of the pollfd array right after qpoll(). Do NOT index a pollfd array by
+// position here: the peer list can change while we are draining net_socket.
+static void FWD_ProcessProbes(peer_t *p) {
   int i;
-  int current_probe_pfd = 0;
   const void *payload;
   int payload_len;
 
@@ -387,7 +397,7 @@ static void FWD_ProcessProbes(peer_t *p, net_pollfd_t *pfds) {
 
   for (i = 0; i < p->num_probes; i++) {
     if (p->probes[i].s != INVALID_SOCKET) {
-      if (pfds[current_probe_pfd].revents & POLLIN) {
+      if (p->probes[i].revents & POLLIN) {
         if (NET_GetPacket(p->probes[i].s, &net_message)) {
           if (NET_CompareAddress(&p->to, &net_from)) {
             // Any reply from the server on the probe socket is enough to
@@ -413,13 +423,13 @@ static void FWD_ProcessProbes(peer_t *p, net_pollfd_t *pfds) {
           }
         }
       }
-      current_probe_pfd++;
     }
   }
 }
 
 static void FWD_network_update(void) {
   net_pollfd_t *pfds = NULL;
+  pfd_owner_t *owners = NULL;
   int nfds = 0;
   int max_fds = 2; // net + stdin
   int retval;
@@ -427,10 +437,15 @@ static void FWD_network_update(void) {
   int stdin_idx = -1;
   peer_t *p;
   int i;
-  int current_pfd_idx;
 
-  // Calculate max FDs needed
+  // Calculate max FDs needed, and clear stale readiness from the previous
+  // iteration so a peer we do not poll this time never looks ready.
   for (p = peers; p; p = p->next) {
+    p->revents = 0;
+    for (i = 0; i < p->num_probes; i++) {
+      p->probes[i].revents = 0;
+    }
+
     if (p->ps == ps_pingprobe) {
       max_fds += p->num_probes;
     } else {
@@ -439,6 +454,9 @@ static void FWD_network_update(void) {
   }
 
   pfds = Sys_malloc(sizeof(net_pollfd_t) * max_fds);
+  // owners[i] records who owns pfds[i]. Sys_malloc() zeroes, so entries we
+  // never fill in (net_socket, stdin) stay { NULL, NULL } and are skipped.
+  owners = Sys_malloc(sizeof(pfd_owner_t) * max_fds);
 
   // select on main server socket
   pfds[nfds].fd = net_socket;
@@ -449,18 +467,22 @@ static void FWD_network_update(void) {
   for (p = peers; p; p = p->next) {
     // select on peers sockets
     if (p->ps == ps_pingprobe) {
-      for (i = 0; i < p->num_probes; i++) {
+      for (i = 0; i < p->num_probes && nfds < max_fds; i++) {
         if (p->probes[i].s != INVALID_SOCKET) {
           pfds[nfds].fd = p->probes[i].s;
           pfds[nfds].events = POLLIN;
           pfds[nfds].revents = 0;
+          owners[nfds].peer = p;
+          owners[nfds].probe = &p->probes[i];
           nfds++;
         }
       }
-    } else {
+    } else if (nfds < max_fds) {
       pfds[nfds].fd = p->s;
       pfds[nfds].events = POLLIN;
       pfds[nfds].revents = 0;
+      owners[nfds].peer = p;
+      owners[nfds].probe = NULL;
       nfds++;
     }
   }
@@ -469,7 +491,7 @@ static void FWD_network_update(void) {
 #ifndef APP_DLL
 #ifndef _WIN32
   // try read stdin only if connected to a terminal.
-  if (isatty(STDIN) && isatty(STDOUT)) {
+  if (isatty(STDIN) && isatty(STDOUT) && nfds < max_fds) {
     pfds[nfds].fd = STDIN;
     pfds[nfds].events = POLLIN;
     pfds[nfds].revents = 0;
@@ -485,8 +507,22 @@ retry:
       goto retry;
     }
     perror("poll");
+    Sys_free(owners);
     Sys_free(pfds);
     return;
+  }
+
+  // Copy readiness out of pfds and onto the owning peer/probe *now*, while the
+  // pfds <-> peers mapping is still valid. Draining net_socket below can create
+  // new peers (SVC_DirectConnect() -> FWD_peer_new() prepends to 'peers') and
+  // can move an existing peer into ps_pingprobe with a different socket count,
+  // so any later walk of 'peers' no longer lines up with pfds positionally.
+  for (i = 0; i < nfds; i++) {
+    if (owners[i].probe) {
+      owners[i].probe->revents = pfds[i].revents;
+    } else if (owners[i].peer) {
+      owners[i].peer->revents = pfds[i].revents;
+    }
   }
 
   // read console input.
@@ -565,24 +601,21 @@ retry:
     }
   }
 
-  // now lets check peers sockets, perhaps we have input packets too
-  current_pfd_idx = 1; // skip net_socket
+  // now lets check peers sockets, perhaps we have input packets too.
+  // NOTE: readiness is read from p->revents / p->probes[].revents, never by
+  // indexing pfds here - 'peers' may have grown since pfds was built.
+  // A peer created during this iteration has revents == 0 (Sys_malloc() zeroes)
+  // and is simply picked up on the next pass.
   for (p = peers; p; p = p->next) {
     if (p->ps == ps_pingprobe) {
-      FWD_ProcessProbes(p, &pfds[current_pfd_idx]);
-
-      // count how many we used
-      for (i = 0; i < p->num_probes; i++) {
-        if (p->probes[i].s != INVALID_SOCKET)
-          current_pfd_idx++;
-      }
+      FWD_ProcessProbes(p);
 
       // Check completion again in case we got last packet or timed out
       FWD_CheckProbeCompletion(p);
       continue; // Skip normal processing for this peer
     }
 
-    if (pfds[current_pfd_idx].revents & POLLIN) {
+    if (p->revents & POLLIN) {
       // yeah, we have packet, read it then
       for (;;) {
         if (!NET_GetPacket(p->s, &net_message))
@@ -620,8 +653,6 @@ retry:
       } // for (;;)
     } // if(POLLIN)
 
-    current_pfd_idx++;
-
     if (p->ps == ps_challenge || p->ps == ps_connecting) {
       // send challenge time to time
       if (time(NULL) - p->connect > 2) {
@@ -632,6 +663,7 @@ retry:
     }
   } // for (p = peers; p; p = p->next)
 
+  Sys_free(owners);
   Sys_free(pfds);
 }
 
