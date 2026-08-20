@@ -32,8 +32,23 @@ typedef struct {
 	probe_t *probe; // NULL when the entry is the peer's main socket
 } pfd_owner_t;
 
+// Both are complete connectionless packets, including the 0xffffffff
+// out-of-band header the receiver checks before parsing the command.
 static const char probe_payload_qw[] = {0xff, 0xff, 0xff, 0xff, 'p', 'i', 'n', 'g', '\n'};
-static const char probe_payload_gen[] = {A2A_PING, 0};
+static const char probe_payload_gen[] = {0xff, 0xff, 0xff, 0xff, A2A_PING, 0};
+
+// Probes must retransmit exactly what they first sent, so both send sites take
+// the payload from here.
+static void FWD_ProbePayload(const peer_t *p, const void **payload, int *payload_len)
+{
+	if (p->proto == pr_qw) {
+		*payload = probe_payload_qw;
+		*payload_len = sizeof(probe_payload_qw);
+	} else {
+		*payload = probe_payload_gen;
+		*payload_len = sizeof(probe_payload_gen);
+	}
+}
 
 cvar_t *sv_pathprobe_enable;
 cvar_t *sv_pathprobe_count;
@@ -254,16 +269,21 @@ void FWD_PeerStartProbing(peer_t *p) {
   }
   p->probe_start_time = Sys_DoubleTime();
 
-  if (p->proto == pr_qw) {
-    payload = probe_payload_qw;
-    payload_len = sizeof(probe_payload_qw);
-  } else {
-    payload = probe_payload_gen;
-    payload_len = sizeof(probe_payload_gen);
-  }
+  FWD_ProbePayload(p, &payload, &payload_len);
 
   // Use existing socket as first probe
   if (p->s != INVALID_SOCKET) {
+    // Discard whatever is already queued on it. On a reconnect this socket has
+    // been carrying game traffic, and FWD_ProcessProbes() accepts any packet
+    // from p->to as a reply: a leftover frame would score as a near-zero RTT
+    // that no real sample can beat, so probes[0] would always "win" and the
+    // peer would silently keep the port it already had.
+    // NOTE: recvfrom() directly, not NET_GetPacket() - our caller
+    // (SVC_DirectConnect) is still using net_message/net_from.
+    char drain[MSG_BUF_SIZE];
+    while (recvfrom(p->s, drain, sizeof(drain), 0, NULL, NULL) >= 0)
+      ;
+
     p->probes[0].s = p->s;
     p->probes[0].send_time = Sys_DoubleTime();
     p->probes[0].rtt = -1;
@@ -387,13 +407,7 @@ static void FWD_ProcessProbes(peer_t *p) {
   const void *payload;
   int payload_len;
 
-  if (p->proto == pr_qw) {
-    payload = QW_PROBE_PAYLOAD;
-    payload_len = sizeof(QW_PROBE_PAYLOAD) - 1;
-  } else {
-    payload = GEN_PROBE_PAYLOAD;
-    payload_len = sizeof(GEN_PROBE_PAYLOAD) - 1;
-  }
+  FWD_ProbePayload(p, &payload, &payload_len);
 
   for (i = 0; i < p->num_probes; i++) {
     if (p->probes[i].s != INVALID_SOCKET) {
@@ -434,7 +448,9 @@ static void FWD_network_update(void) {
   int max_fds = 2; // net + stdin
   int retval;
   int net_idx = -1;
+#ifndef _WIN32
   int stdin_idx = -1;
+#endif
   peer_t *p;
   int i;
 
@@ -527,11 +543,21 @@ retry:
 
   // read console input.
   // NOTE: we do not do that if we are in DLL mode...
-  if (stdin_idx != -1 && (pfds[stdin_idx].revents & POLLIN)) {
+  {
     fd_set rfds;
     FD_ZERO(&rfds);
-    FD_SET(STDIN, &rfds);
+#ifdef _WIN32
+    // STDIN gets no pollfd entry on Windows: WSAPoll() handles sockets only.
+    // The Windows half of Sys_ReadSTDIN() polls the console with
+    // _kbhit()/_getch() and ignores the fd_set, so it has to be called every
+    // iteration or console commands never get read.
     Sys_ReadSTDIN(&ps, rfds);
+#else
+    if (stdin_idx != -1 && (pfds[stdin_idx].revents & POLLIN)) {
+      FD_SET(STDIN, &rfds);
+      Sys_ReadSTDIN(&ps, rfds);
+    }
+#endif
   }
 
   // if we have input packet on main server/proxy socket, then read it

@@ -154,8 +154,6 @@ typedef enum
 
 #define MAX_PING_PROBES 10
 #define PROBE_SAMPLES_COUNT 3
-#define QW_PROBE_PAYLOAD "\xff\xff\xff\xffping\n"
-#define GEN_PROBE_PAYLOAD "\x6B" // A2A_PING
 
 typedef struct {
   int s;

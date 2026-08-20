@@ -293,19 +293,17 @@ static void SVC_DirectConnect (void)
 	// this was new peer, lets register it then
 	if ((p = FWD_peer_new(prx, port, &net_from, userinfo, qport, proto, true)))
 	{
-		qbool do_probe = false;
+		// The cvar is the server-wide default; a client may opt out per
+		// connection with a "pathprobe" userinfo key. It stays a kill switch:
+		// when disabled no client can turn probing back on.
+		qbool do_probe = !!sv_pathprobe_enable->integer;
 		char val[64];
 
 		Sys_DPrintf("peer %s:%d added or reused\n", inet_ntoa(net_from.sin_addr), (int)ntohs(net_from.sin_port));
 
-		// Check if client wants to override pingprobe setting
+		// Check if client wants to override pathprobe setting
 		Info_ValueForKey(userinfo, "pathprobe", val, sizeof(val));
-		if (val[0]) {
-			do_probe = atoi(val);
-		}
-
-		// Check if feature is globally disabled
-		if (!sv_pathprobe_enable->integer) {
+		if (val[0] && !atoi(val)) {
 			do_probe = false;
 		}
 
