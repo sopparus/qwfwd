@@ -67,11 +67,11 @@ ezQuake. Configure it in `qwfwd.cfg`:
 
 ```
 sv_pathprobe_enable 1
-sv_pathprobe_count 32
+sv_pathprobe_count 64
 sv_pathprobe_delay 1000
 ```
 
-`sv_pathprobe_count` defaults to 3 and is clamped to 1–64 candidates, including
+`sv_pathprobe_count` defaults to 64 and is clamped to 1–64 candidates, including
 the existing source port. Additional sockets are only opened while the shared
 active probe count is below 64; existing sockets can still be tested when that
 limit is reached. Concurrent connections can therefore get fewer candidates

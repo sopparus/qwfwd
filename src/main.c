@@ -133,7 +133,7 @@ DWORD WINAPI FWD_proc(void *lpParameter)
 	coords			= Cvar_Get("coords",		"", CVAR_SERVERINFO);
 
 	sv_pathprobe_enable = Cvar_Get("sv_pathprobe_enable", "1", 0);
-	sv_pathprobe_count  = Cvar_Get("sv_pathprobe_count",  "3", 0);
+	sv_pathprobe_count  = Cvar_Get("sv_pathprobe_count",  "64", 0);
 	sv_pathprobe_delay  = Cvar_Get("sv_pathprobe_delay",  "1000", 0);
 
 	// register basic commands
