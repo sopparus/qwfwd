@@ -152,7 +152,7 @@ typedef enum
 } peer_state_t;
 
 
-#define MAX_PING_PROBES 10
+#define MAX_PING_PROBES 64
 #define PROBE_SAMPLES_COUNT 3
 
 typedef struct {

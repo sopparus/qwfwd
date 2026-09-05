@@ -274,10 +274,8 @@ void FWD_PeerStartProbing(peer_t *p) {
   // Use existing socket as first probe
   if (p->s != INVALID_SOCKET) {
     // Discard whatever is already queued on it. On a reconnect this socket has
-    // been carrying game traffic, and FWD_ProcessProbes() accepts any packet
-    // from p->to as a reply: a leftover frame would score as a near-zero RTT
-    // that no real sample can beat, so probes[0] would always "win" and the
-    // peer would silently keep the port it already had.
+    // been carrying game traffic or replies from an earlier probe. Packets
+    // arriving after this drain are validated by FWD_ProcessProbes().
     // NOTE: recvfrom() directly, not NET_GetPacket() - our caller
     // (SVC_DirectConnect) is still using net_message/net_from.
     char drain[MSG_BUF_SIZE];
@@ -322,7 +320,6 @@ static void FWD_CheckProbeCompletion(peer_t *p) {
   double best_rtt = 99999.0;
   double timeout = sv_pathprobe_delay->value / 1000.0;
   qbool all_finished = true;
-  int fully_sampled = 0;
 
   if (timeout <= 0.0)
     timeout = 1.0;
@@ -331,24 +328,15 @@ static void FWD_CheckProbeCompletion(peer_t *p) {
 
   // Check if all probes are finished
   for (i = 0; i < p->num_probes; i++) {
-    if (p->probes[i].samples_received >= 2)
-      fully_sampled++;
-
     if (p->probes[i].samples_received < PROBE_SAMPLES_COUNT) {
       all_finished = false;
     }
   }
 
-  // Wait for at least 2 samples from everyone to filter jitter, unless timed
-  // out
-  if (fully_sampled == p->num_probes)
-    goto select_best;
-
   // Only proceed if we timed out or all probes finished
   if (!all_finished && Sys_DoubleTime() - p->probe_start_time <= timeout)
     return;
 
-select_best:
   // Find best RTT
   for (i = 0; i < p->num_probes; i++) {
     if (p->probes[i].rtt > 0 && p->probes[i].rtt < best_rtt) {
@@ -358,25 +346,39 @@ select_best:
   }
 
   if (best_idx != -1) {
-    Sys_DPrintf("Probe finished in %.2f ms. Best RTT: %.2f ms (idx %d)\n",
-                (Sys_DoubleTime() - p->probe_start_time) * 1000.0,
-                best_rtt * 1000.0, best_idx);
+    struct sockaddr_in local_addr;
+    socklen_t local_len = sizeof(local_addr);
+    char port[16];
     p->s = p->probes[best_idx].s;
+    if (getsockname(p->s, (struct sockaddr *)&local_addr, &local_len) == 0)
+      snprintf(port, sizeof(port), "%u", (unsigned)ntohs(local_addr.sin_port));
+    else
+      strlcpy(port, "unknown", sizeof(port));
+
+    Sys_DPrintf("Probe finished in %.2f ms. Source port %s: min proxy-server RTT %.2f ms (%d/%d replies, %d ports)\n",
+                (Sys_DoubleTime() - p->probe_start_time) * 1000.0,
+                port, best_rtt * 1000.0,
+                p->probes[best_idx].samples_received, PROBE_SAMPLES_COUNT,
+                p->num_probes);
 
     // Notify client about the best ping found
     if (p->proto == pr_qw) {
       Netchan_OutOfBandPrint(net_socket, &p->from,
-                             "%c[qwfwd] Best RTT: %.2f ms\n", A2C_PRINT,
-                             best_rtt * 1000.0);
+                             "%c[qwfwd] Source port %s: min proxy-server RTT %.2f ms (%d/%d replies, %d ports)\n", A2C_PRINT,
+                             port, best_rtt * 1000.0,
+                             p->probes[best_idx].samples_received,
+                             PROBE_SAMPLES_COUNT, p->num_probes);
     } else {
       Netchan_OutOfBandPrint(net_socket, &p->from,
-                             "print\n[qwfwd] Best RTT: %.2f ms\n",
-                             best_rtt * 1000.0);
+                             "print\n[qwfwd] Source port %s: min proxy-server RTT %.2f ms (%d/%d replies, %d ports)\n",
+                             port, best_rtt * 1000.0,
+                             p->probes[best_idx].samples_received,
+                             PROBE_SAMPLES_COUNT, p->num_probes);
     }
 
   } else {
     Sys_DPrintf("Probe finished. No reply, using default.\n");
-    p->s = p->probes[0].s; // Fallback to first
+    // Keep the original socket, including if no probe socket was available.
   }
 
   // Close other sockets
@@ -412,29 +414,31 @@ static void FWD_ProcessProbes(peer_t *p) {
   for (i = 0; i < p->num_probes; i++) {
     if (p->probes[i].s != INVALID_SOCKET) {
       if (p->probes[i].revents & POLLIN) {
-        if (NET_GetPacket(p->probes[i].s, &net_message)) {
-          if (NET_CompareAddress(&p->to, &net_from)) {
-            // Any reply from the server on the probe socket is enough to
-            // measure RTT
+        qbool received = false;
+        // Drain this batch before sending the next probe, so queued duplicate
+        // ACKs cannot be timed against that next probe's send timestamp.
+        while (NET_GetPacket(p->probes[i].s, &net_message)) {
+          if (!received &&
+              p->probes[i].samples_received < p->probes[i].samples_sent &&
+              NET_CompareAddress(&p->to, &net_from) &&
+              net_message.cursize == 1 && net_message.data[0] == A2A_ACK) {
             double rtt = Sys_DoubleTime() - p->probes[i].send_time;
 
+            received = true;
             p->probes[i].samples_received++;
 
             if (p->probes[i].rtt == -1 || rtt < p->probes[i].rtt) {
               p->probes[i].rtt = rtt;
-              Sys_DPrintf(
-                  "Pathprobe reply on socket %d, sample %d, RTT %.2f ms\n",
-                  p->probes[i].s, p->probes[i].samples_received,
-                  p->probes[i].rtt * 1000.0);
             }
-
-            // Send next sample if needed
-            if (p->probes[i].samples_sent < PROBE_SAMPLES_COUNT) {
-              p->probes[i].samples_sent++;
-              p->probes[i].send_time = Sys_DoubleTime();
-              NET_SendPacket(p->probes[i].s, payload_len, payload, &p->to);
-            }
+            Sys_DPrintf("Pathprobe reply on socket %d, sample %d, RTT %.2f ms\n",
+                        p->probes[i].s, p->probes[i].samples_received,
+                        rtt * 1000.0);
           }
+        }
+        if (received && p->probes[i].samples_sent < PROBE_SAMPLES_COUNT) {
+          p->probes[i].samples_sent++;
+          p->probes[i].send_time = Sys_DoubleTime();
+          NET_SendPacket(p->probes[i].s, payload_len, payload, &p->to);
         }
       }
     }
@@ -751,4 +755,3 @@ void FWD_Init(void)
 
 	Cmd_AddCommand("cllist", FWD_Cmd_ClList_f);
 }
-
